@@ -1,0 +1,215 @@
+#!/bin/bash
+
+# Start all process describe in ENV variables.
+# The process running in subshell.
+
+LISTEN="STARTUP_COMMAND_RUN"
+
+rm -Rf /home/www/fcgiwrap.socket
+
+# Checking if the mandatory variables is not same defined
+# Not same defined is the common container wrapper.
+
+declare -a RESPONSE=()
+
+[ -v CA ] || RESPONSE+=("environment: Specifies the CA.")
+[ -v CA_PASSWORD ] || RESPONSE+=("environment: Specifies the CA_PASSWORD.")
+[ -v RSA_KEY_SIZE ] || RESPONSE+=("environment: Specifies the RSA_KEY_SIZE.")
+[ -v DOMAIN ] || RESPONSE+=("environment: Specifies the DOMAIN.")
+[ -v EXPIRE ] || RESPONSE+=("environment: Specifies the EXPIRE.")
+[ -v COUNTRY ] || RESPONSE+=("environment: Specifies the COUNTRY.")
+[ -v STATE ] || RESPONSE+=("environment: Specifies the STATE.")
+[ -v LOCALITY ] || RESPONSE+=("environment: Specifies the LOCALITY.")
+[ -v ORGANIZATION ] || RESPONSE+=("environment: Specifies the ORGANIZATION.")
+[ -v ORGANIZATION_UNIT ] || RESPONSE+=("environment: Specifies the ORGANIZATION_UNIT.")
+
+# Checking if RESPONSE array is not empty, printing the messages.
+# Calling the runner function to stop the container.
+
+if [ ${#RESPONSE[@]} -ne 0 ]; then
+  printf '%s\n' "${RESPONSE[@]}"
+  exit
+fi
+
+# Unsetting RESPONSE array
+
+unset RESPONSE
+
+# Checks the validity of three certificate files.
+
+check() {
+  [[ -f "$1" && -f "$2" && -f "$3" ]] || return 1
+
+  local req=$(openssl req -noout -modulus -in "$3" | openssl md5)
+  local crt=$(openssl x509 -noout -modulus -in "$1" | openssl md5)
+  local rsa=$(openssl rsa -noout -modulus -in "$2" | openssl md5)
+
+  [[ "$crt" != "$rsa" || "$crt" != "$req" ]] && return 1
+
+  return 0
+}
+
+# The function is extracting the command to be executed from an environment variable.
+
+process() {
+  local run=${1%%|*}
+  local run=${run##*=}
+  echo $run
+  return 0
+}
+
+# Naive check runs checks once a minute to see if either of the processes exited.
+# This illustrates part of the heavy lifting you need to do if you want to run
+# more than one service in a container. The container exits with an error
+# if it detects that either of the processes has exited.
+# Otherwise it loops forever, waking up every 8 seconds
+
+runner() {
+  kill -SIGINT 1
+  exit 1
+}
+
+# The function is extracting the process name from environment variable.
+
+name() {
+  local brew=${1##*|}
+  [[ "$1" == "$brew" ]] && brew=${1##*=}
+  echo "${brew/ /}"
+  return 0
+}
+
+# Make directories
+[ -d "/app/configuration/ca" ] || mkdir -p /app/configuration/ca
+[ -d "/app/configuration/ca/db" ] || mkdir -p /app/configuration/ca/db
+[ -d "/app/configuration/ca/private" ] || mkdir -p /app/configuration/ca/private
+[ -d "/app/configuration/archive" ] || mkdir -p /app/configuration/archive
+[ -d "/app/configuration/certs" ] || mkdir -p /app/configuration/certs
+[ -d "/app/configuration/crl" ] || mkdir -p /app/configuration/crl
+[ -d "/app/configuration/conf" ] || mkdir -p /app/configuration/conf
+[ -d "/app/configuration/csr" ] || mkdir -p /app/configuration/csr
+[ -d "/app/configuration/private" ] || mkdir -p /app/configuration/private
+
+# Secure key directories
+[ 700 -ne $(stat -c %a "/app/configuration/ca/private") ] || chmod 0700 /app/configuration/ca/private
+[ 700 -ne $(stat -c %a "/app/configuration/private") ] || chmod 0700 /app/configuration/private
+
+# Create empty databases
+[ -f "/app/configuration/ca/db/certificate.db" ] || touch /app/configuration/ca/db/certificate.db
+[ -f "/app/configuration/ca/db/certificate.db.attr" ] || touch /app/configuration/ca/db/certificate.db.attr
+[ -f "/app/configuration/ca/db/crt.srl" ] || echo 01 >/app/configuration/ca/db/crt.srl
+[ -f "/app/configuration/ca/db/crl.srl" ] || echo 01 >/app/configuration/ca/db/crl.srl
+[ -f "/app/configuration/server.conf" ] || cp /app/template/server.conf /app/configuration/server.conf
+[ -f "/app/configuration/client.conf" ] || cp /app/template/client.conf /app/configuration/client.conf
+[ -f "/app/configuration/ca.conf" ] || cp /app/template/ca.conf /app/configuration/ca.conf
+
+# Create the root CA key
+[ -f "/app/configuration/ca/private/ca.key" ] || openssl genrsa -out /app/configuration/ca/private/ca.key -passout env:CA_PASSWORD $RSA_KEY_SIZE
+[ 400 -ne $(stat -c %a "/app/configuration/ca/private/ca.key") ] || chmod 0400 /app/configuration/ca/private/ca.key
+
+# Check if exists a valid CA
+check "/app/configuration/ca/ca.crt" "/app/configuration/ca/private/ca.key" "/app/configuration/ca/ca.csr"
+
+if [ $? -ne 0 ]; then
+  rm -Rf /app/configuration/ca/ca.crt \
+    /app/configuration/ca/ca.csr \
+    /app/configuration/crl/ca.crl
+
+  # Create the root CA csr
+  printf "Generate the new Certificate Authority $CA\n"
+  # ++++++++++ Start ++++++++++
+  #
+  openssl req -new -batch \
+    -config /app/configuration/ca.conf \
+    -key /app/configuration/ca/private/ca.key \
+    -out /app/configuration/ca/ca.csr \
+    -passin env:CA_PASSWORD \
+    2>/dev/null
+  #
+  # Create the root CA certificate
+  openssl ca -selfsign -batch -notext \
+    -config /app/configuration/ca.conf \
+    -in /app/configuration/ca/ca.csr \
+    -out /app/configuration/ca/ca.crt \
+    -days 8192 \
+    -extensions root_ca_ext \
+    -passin env:CA_PASSWORD \
+    2>/dev/null
+  #
+  # Create the root CRL
+  openssl ca -gencrl -batch \
+    -config /app/configuration/ca.conf \
+    -out /app/configuration/crl/ca.crl \
+    2>/dev/null
+  # ++++++++++ End ++++++++++
+fi
+
+# Print Information Certificate Authority
+printf "Loaded Certificate Authority $CA\n"
+openssl x509 -in /app/configuration/ca/ca.crt -text -noout
+
+# Check if exists a valid server certificate
+check "/app/configuration/certs/server.crt" "/app/configuration/private/server.key" "/app/configuration/csr/server.csr"
+
+if [ $? -ne 0 ]; then
+  SAN="DNS:*.${DOMAIN},DNS:${DOMAIN}"
+  export SAN
+
+  rm -Rf /app/configuration/certs/server.crt \
+    /app/configuration/csr/server.csr
+
+  # Create the server key and csr
+  printf "Generate the new server Certificate:\n*.${DOMAIN}\n${DOMAIN}\n"
+  # ++++++++++ Start ++++++++++
+  #
+  openssl req -new -nodes \
+    -config /app/configuration/server.conf \
+    -keyout /app/configuration/private/server.key \
+    -out /app/configuration/csr/server.csr \
+    2>/dev/null
+  chmod 0400 /app/configuration/private/server.key
+  #
+  # Create the server certificate
+  openssl ca -batch -notext \
+    -config /app/configuration/ca.conf \
+    -in /app/configuration/csr/server.csr \
+    -out /app/configuration/certs/server.crt \
+    -days 3652 \
+    -extensions server_ext \
+    -passin env:CA_PASSWORD \
+    2>/dev/null
+  # ++++++++++ End ++++++++++
+fi
+
+# Start all process describe in ENV variables.
+# The process running in subshell.
+
+printenv | more | grep "${LISTEN}" | while read -r line; do
+  process=$(process "$line")
+  sh -c "$process" &
+done
+
+trap runner SIGINT SIGQUIT SIGTERM
+
+while
+  sleep 8 &
+  wait $!
+do
+
+  printenv | more | grep "${LISTEN}" | while read -r line; do
+
+    # Grep process status
+
+    alive=$(name "$line")
+    ps -eo stat,pid,comm | grep -v grep | grep -m 1 "${alive}" | grep -E "^[R S]" > /dev/null
+
+    # If the greps above find anything, they exit with 0 status
+    # If they are not both 0, then something is wrong
+
+    if [ $? -ne 0 ]; then
+      echo "The processes ${alive} already exited."
+      runner
+    fi
+
+  done
+
+done

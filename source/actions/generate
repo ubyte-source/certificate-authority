@@ -1,0 +1,129 @@
+#!/bin/bash
+
+# Improved CA Generation Certificate Script
+
+# Define log file for errors and operations
+LOCK="/tmp/file.lock"
+LOGS="/var/log/generation.log"
+
+# Function to log messages
+log_message() {
+  echo "$(date +"%Y-%m-%d %H:%M:%S") - $1" >> $LOGS
+}
+
+# Attempt to acquire lock with retry for up to 20 seconds
+exec 200>$LOCK
+LOCK_TIMEOUT=20
+LOCK_WAIT=0
+
+while ! flock -n 200 ; do
+  if [ "$LOCK_WAIT" -ge "$LOCK_TIMEOUT" ]; then
+    log_message "Failed to acquire lock after $LOCK_TIMEOUT seconds, another instance of the script is currently running."
+    exit 1
+  fi
+  sleep 1
+  ((LOCK_WAIT++))
+done
+
+# Lock acquired successfully
+log_message "Lock acquired successfully."
+
+echo $NAME_COMMON
+# Validate NAME_COMMON
+if ! [[ "$NAME_COMMON" =~ ^[a-z0-9]{8}$ ]]; then
+  printf "HTTP/1.1 404 Not Found\n\n"
+  log_message "Invalid name: $NAME_COMMON"
+  exit 1
+fi
+
+# Initialize an array to hold environment variable checks
+declare -a RESPONSE=()
+
+# Check for mandatory environment variables
+[ -v ARCHIVE ] || RESPONSE+=("environment: Specifies the ARCHIVE.")
+[ -v ARCHIVE_INDEX ] || RESPONSE+=("environment: Specifies the ARCHIVE_INDEX.")
+
+# Check if RESPONSE array is not empty and print messages
+if [ ${#RESPONSE[@]} -ne 0 ]; then
+  printf '%s\n' "${RESPONSE[@]}"
+  log_message "Missing environment variables: ${RESPONSE[*]}"
+  exit 1
+fi
+
+# Unset RESPONSE array to clean up
+unset RESPONSE
+
+# Start main process
+while read -ra fields; do
+  st=${fields[0]}
+  id=${fields[2]}
+  dn=${fields[4]}
+
+  # Parse the DN to obtain the CN for matching
+  cn=$(echo "$dn" | awk -F 'CN=' '{print $2}' | awk -F '/' '{print $1}')
+
+  [[ "$st" == "V" && "$cn" == "$NAME" ]] || continue
+
+  # Find the PEM in the archive folder
+  certificate=$(find "$ARCHIVE" -name "${id}.pem" -print -quit)
+  [ -f "$certificate" ] || continue
+
+  # Revoke the certificate with error handling
+  if ! openssl ca -config /app/configuration/ca.conf -revoke "$certificate" -crl_reason "Superseded" 2>>$LOGS; then
+    log_message "Failed to revoke certificate $certificate"
+    continue
+  fi
+
+done <"$ARCHIVE_INDEX"
+
+# Regenerate the CRL with error handling
+if ! openssl ca -gencrl -config /app/configuration/ca.conf -out /app/configuration/crl/ca.crl 2>>$LOGS; then
+  log_message "Failed to generate CRL"
+  exit 1
+fi
+
+printf "HTTP/1.1 200 OK\n"
+printf "Content-Disposition: attachment; filename=\"%s.tar.gz\"\n" "$NAME_COMMON"
+printf "Content-type: application/gzip\n\n"
+
+# Prepare destination directory
+TEMPORARY_FILES=$(mktemp -d)
+
+# Convert authority to PEM format
+openssl x509 -in /app/configuration/ca/ca.crt -outform PEM -out ${TEMPORARY_FILES}/authority.pem 2>>$LOGS
+
+# Create the client key and CSR with error handling
+if ! openssl req -new -nodes -config /app/configuration/client.conf -keyout ${TEMPORARY_FILES}/client.key -out ${TEMPORARY_FILES}/client.csr 2>>$LOGS; then
+  log_message "Failed to create client key and CSR"
+  exit 1
+fi
+
+# Secure key file
+chmod 0400 ${TEMPORARY_FILES}/client.key
+
+# Create the client crt with error handling
+if ! openssl ca -batch -notext -config /app/configuration/ca.conf -in ${TEMPORARY_FILES}/client.csr -out ${TEMPORARY_FILES}/client.crt -days ${EXPIRE} -extensions client_ext 2>>$LOGS; then
+  log_message "Failed to create client certificate"
+  exit 1
+fi
+
+# Release the lock
+flock -u 200
+
+# Convert the new generated files into PEM format
+openssl rsa -in ${TEMPORARY_FILES}/client.key -outform PEM -out ${TEMPORARY_FILES}/key.pem 2>>$LOGS
+openssl x509 -in ${TEMPORARY_FILES}/client.crt -outform PEM -out ${TEMPORARY_FILES}/certificate.pem 2>>$LOGS
+
+# Create the TAR archive
+tar -czf ${TEMPORARY_FILES}.tar.gz -C ${TEMPORARY_FILES} key.pem certificate.pem authority.pem
+
+# Serve TAR archive to client
+cat ${TEMPORARY_FILES}.tar.gz
+
+# Clean temporary files
+rm -rf ${TEMPORARY_FILES} ${TEMPORARY_FILES}.tar.gz
+
+# Successful execution log message
+log_message "Successfully generated and served certificate package for $NAME_COMMON"
+
+exit 0
