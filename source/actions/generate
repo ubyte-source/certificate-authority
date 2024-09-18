@@ -30,7 +30,7 @@ log_message "Lock acquired successfully."
 
 echo $NAME_COMMON
 # Validate NAME_COMMON
-if ! [[ "$NAME_COMMON" =~ ^[a-z0-9]{8}$ ]]; then
+if ! [[ "$NAME_COMMON" =~ ^[a-z0-9-]{8,}$ ]]; then
   printf "HTTP/1.1 404 Not Found\n\n"
   log_message "Invalid name: $NAME_COMMON"
   exit 1
