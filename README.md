@@ -14,7 +14,7 @@ This Docker setup uses Alpine Linux with Nginx, fcgiwrap, and OpenSSL to provide
 
 - Docker must be installed on your machine.
 - Basic knowledge of Docker commands and principles.
-- DNS must be configured to point to the host that is running Docker to allow certificate generation by accessing `https://<8characters>.domain.lan/generate`.
+- DNS must be configured to point to the host that is running Docker to allow certificate generation by accessing `https://<^[a-z0-9-]{8,}$>.domain.lan/generate`.
 
 ## Getting Started
 
